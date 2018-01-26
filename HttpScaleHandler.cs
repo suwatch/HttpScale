@@ -80,7 +80,7 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
                 {
                     // worker selection
                     var requestId = NextHttpScaleRequestId(hostingInfo.SiteName);
-                    var selected = await _manager.OnBeginRequest(requestId, hostingInfo.SiteName, hostingInfo.DefaultHostName, workers);
+                    var selected = await _manager.DispatchRequestAsync(requestId, hostingInfo.SiteName, hostingInfo.DefaultHostName, workers);
 
                     var info = new HttpScaleInfo();
                     info.RequestId = string.Format("{0}/{1}", requestId, selected);
@@ -110,7 +110,7 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
             {
                 // this is forwarded requests
                 var requestId = NextHttpScaleRequestId(hostingInfo.SiteName);
-                var selected = await _manager.OnBeginRequest(requestId, hostingInfo.SiteName, hostingInfo.DefaultHostName, workers.Length >= token.Workers.Length ? workers : token.Workers);
+                var selected = await _manager.DispatchRequestAsync(requestId, hostingInfo.SiteName, hostingInfo.DefaultHostName, workers.Length >= token.Workers.Length ? workers : token.Workers);
 
                 var info = new HttpScaleInfo();
                 info.RequestId = string.Format("{0}/{1}", requestId, selected);
@@ -142,8 +142,12 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
             }
             else
             {
-                var runtimeSiteName = ParseRuntimeSiteName(requestId);
-                _manager.OnEndRequest(requestId, runtimeSiteName, statusCode, statusReason);
+                string runtimeSiteName;
+                string originalRequestId;
+                string workerName;
+                ParseCompletedRequestId(requestId, out runtimeSiteName, out originalRequestId, out workerName);
+
+                _manager.OnRequestCompleted(requestId, runtimeSiteName, (int)statusCode, statusReason, workerName);
             }
         }
 
@@ -302,19 +306,18 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
             return string.Format("{0}/{1:x16}/{2}", IdnHelper.GetAscii(runtimeSiteName), (ulong)nextId, HttpScaleEnvironment.TickCount);
         }
 
-        public static string ParseRuntimeSiteName(string httpScaleRequestId)
+        public static void ParseCompletedRequestId(
+            string httpScaleRequestId,
+            out string siteName,
+            out string originalRequestId,
+            out string workerName)
         {
-            return IdnHelper.GetUnicode(httpScaleRequestId.Split('/')[0]);
-        }
+            int firstSeparator = httpScaleRequestId.IndexOf('/');
+            siteName = IdnHelper.GetUnicode(httpScaleRequestId.Substring(0, firstSeparator));
 
-        public static uint ParseEnvironmentTick(string httpScaleRequestId)
-        {
-            return uint.Parse(httpScaleRequestId.Split('/')[2]);
-        }
-
-        public static string ParseWorkerName(string httpScaleRequestId)
-        {
-            return httpScaleRequestId.Split('/')[3];
+            int lastSeparator = httpScaleRequestId.LastIndexOf('/');
+            originalRequestId = httpScaleRequestId.Substring(0, lastSeparator);
+            workerName = httpScaleRequestId.Substring(lastSeparator + 1);
         }
     }
 }

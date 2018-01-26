@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using System.Threading;
@@ -16,223 +17,223 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
 {
     public abstract class SiteRequestDispatcher
     {
-        readonly string siteName;
-        readonly HttpScaleEnvironment environment;
+        // All time are in ticks, which are equivalent to milliseconds, but are cheaper to calculate
+        private const uint BusyStatusDuration = 2000;
+        private const uint QuestionableRequestLatency = 2000;
+        private const uint WorkerExpirationDelay = 40000;
+        private const uint WorkerExpirationCheckInterval = 5000;
+        private const uint PingInterval = 5000;
+        private const uint PingTimeout = 400;
+        private const uint ScaleInterval = 1000;
 
-        //readonly object thisLock = new object();
-        //readonly ConcurrentDictionary<string, WorkerStatus> pendingRequests;
+        private const uint QuestionablePendingRequestCount = 50;
+        private const double QuestionableInstanceRatio = 0.5;
 
-        readonly SemaphoreSlim _scaleLock = new SemaphoreSlim(1, 1);
-        ConcurrentDictionary<string, WorkerStatus> workerList;
-        bool isBurstMode;
+        private readonly int burstLimit;
+        private readonly ConcurrentDictionary<string, SiteMetadata> knownSites;
 
-        //private uint _lastExecute;
-
-        public SiteRequestDispatcher(string siteName, HttpScaleEnvironment environment)
+        public SiteRequestDispatcher(int burstLimit)
         {
-            this.siteName = siteName;
-            this.environment = environment;
-
-            this.workerList = new ConcurrentDictionary<string, WorkerStatus>();
-            //this.pendingRequests = new ConcurrentDictionary<string, WorkerStatus>();
+            this.burstLimit = burstLimit;
+            this.knownSites = new ConcurrentDictionary<string, SiteMetadata>(StringComparer.OrdinalIgnoreCase);
         }
 
-        public ICollection<string> WorkerList
+        public virtual async Task<string> DispatchRequestAsync(
+            string requestId,
+            string siteName,
+            string defaultHostName,
+            string[] knownWorkers)
         {
-            get { return this.workerList.Keys; }
-        }
+            SiteMetadata site = this.knownSites.GetOrAdd(siteName, name => new SiteMetadata(siteName));
 
-        public bool IsBurstMode
-        {
-            get { return this.isBurstMode; }
-        }
+            int currentInstanceCount = this.UpdateWorkerList(site, knownWorkers);
 
-        public virtual async Task<string> DispatchRequestAsync(IList<string> workerList, string requestId)
-        {
-            WorkerStatus selectedWorker;
-            //var now = HttpScaleEnvironment.TickCount;
-            //if (this.workerList.Count > 5 )
-            //{
-            //    if (_lastExecute > now || workerList.Count <= this.workerList.Count)
-            //    {
-            //        selectedWorker = this.workerList.ElementAt((int)(now % this.workerList.Count)).Value;
-            //        Interlocked.Increment(ref selectedWorker.PendingRequestCount);
-            //        return selectedWorker.IPAddress;
-            //    }
-            //}
+            InstanceEndpoint selectedWorker;
 
-            //_lastExecute = now + 5000;
-
-            // TODO, cgillum: should do uninon with existing workerlist since each FE may see different list
-            this.UpdateWorkerList(workerList);
-
-            // TODO, cgillum: race condition for scaling out
-            var intialCount = this.workerList.Count;
-
-            if (this.IsBurstMode)
+            bool isBurstMode = site.IsBurstMode;
+            if (isBurstMode)
             {
-                selectedWorker = await this.SelectBurstModeWorkerAsync();
+                selectedWorker = await this.SelectBurstModeWorkerAsync(site);
             }
             else
             {
-                selectedWorker = this.GetWorkersInPriorityOrder().First();
-
-                // long latency
-                if (this.workerList.All(w => w.Value.PendingRequestCount > 0 && w.Value.IsBusy) || this.workerList.All(w => w.Value.PendingRequestCount >= 50))
+                selectedWorker = GetWorkersInPriorityOrder(site).FirstOrDefault();
+                if (selectedWorker.IsBusy)
                 {
-                    uint latency;
-                    if (selectedWorker.LastPingTick > HttpScaleEnvironment.TickCount)
+                    // The best worker is busy, so we know it's time to scale.
+                    InstanceEndpoint newInstance = await this.ScaleOutAsync(site, currentInstanceCount + 1);
+                    selectedWorker = newInstance ?? selectedWorker;
+                }
+
+                // Pick one request at a time to use for latency tracking
+                uint now = GetCurrentTickCount();
+                if (Interlocked.CompareExchange(ref selectedWorker.HealthTrackingRequestId, requestId, null) == null)
+                {
+                    selectedWorker.HealthTrackingRequestStartTime = now;
+                }
+
+                // If it's a new worker or one that's not serving requests, we'll use it right away. Otherwise
+                // we'll check to see if a ping test is needed, in which case we might decide to scale.
+                if (selectedWorker.PendingRequestCount > 0 &&
+                    selectedWorker.NextAllowedPingTime <= now &&
+                    Interlocked.CompareExchange(ref selectedWorker.PingLock, 1, 0) == 0)
+                {
+                    bool isHealthy = true;
+                    try
                     {
-                        latency = selectedWorker.LastPingLatency;
+                        // Count the number of instances that are of "questionable" health. Use that number
+                        // to decide whether a ping test is needed.
+                        int questionableInstances = site.InstanceList.Values.Count(instance =>
+                            instance.PendingRequestCount > QuestionablePendingRequestCount ||
+                            instance.HealthTrackingRequestStartTime < now - QuestionableRequestLatency);
+
+                        if (questionableInstances >= site.InstanceList.Count * QuestionableInstanceRatio)
+                        {
+                            isHealthy = await this.PingAsync(siteName, selectedWorker, defaultHostName);
+                        }
                     }
-                    else
+                    finally
                     {
-                        var start = HttpScaleEnvironment.TickCount;
-                        var status = await OnPingAsync(selectedWorker.IPAddress);
-                        latency = selectedWorker.LastPingLatency = HttpScaleEnvironment.TickCount - start;
-                        selectedWorker.LastPingTick = HttpScaleEnvironment.TickCount + 5000;
+                        selectedWorker.NextAllowedPingTime = now + PingInterval;
+                        selectedWorker.PingLock = 0;
                     }
 
-                    //System.Diagnostics.Debug.WriteLine("Png {0} {1} {2} {3}ms", DateTime.UtcNow, selectedWorker.IPAddress, status, latency);
-                    //System.Diagnostics.Debug.WriteLine(string.Empty);
-                    if (latency > 100)
+                    if (!isHealthy)
                     {
-                        var newWorker = await ScaleOutAsync(intialCount + 1);
-                        selectedWorker = newWorker ?? selectedWorker;
+                        selectedWorker.IsBusyUntil = now + BusyStatusDuration;
+                        selectedWorker.IsBusy = true;
+
+                        InstanceEndpoint newInstance = await this.ScaleOutAsync(site, currentInstanceCount + 1);
+                        selectedWorker = newInstance ?? selectedWorker;
                     }
                 }
             }
-
-            //if (!this.pendingRequests.TryAdd(requestId, selectedWorker))
-            //{
-            //    throw new ArgumentException(string.Format("A request with ID '{0}' is already pending.", requestId));
-            //}
 
             Interlocked.Increment(ref selectedWorker.PendingRequestCount);
             return selectedWorker.IPAddress;
         }
 
-        public void OnRequestCompleted(string requestId, HttpStatusCode statusCode, string statusPhrase)
+        public void OnRequestCompleted(
+            string requestId,
+            string siteName,
+            int statusCode,
+            string statusPhrase,
+            string ipAddress)
         {
-            WorkerStatus worker;
-            //if (!this.pendingRequests.TryRemove(requestId, out worker))
-            //{
-            //    // TODO: Trace warning
-            //    return;
-            //}
-
-            var workerName = HttpScaleHandler.ParseWorkerName(requestId);
-            //lock (thisLock)
+            SiteMetadata site;
+            if (!this.knownSites.TryGetValue(siteName, out site))
             {
-                if (!this.workerList.TryGetValue(workerName, out worker))
-                {
-                    // TODO: Trace warning
-                    return;
-                }
+                throw new ArgumentException(string.Format("Site '{0}' does not exist in the list of known sites.", siteName));
             }
 
-            var tickCount = HttpScaleEnvironment.TickCount;
-            worker.LastRequestCompleteTick = tickCount;
-            worker.LastRequestLatencyMs = tickCount - HttpScaleHandler.ParseEnvironmentTick(requestId);
-            worker.IsBusy = worker.LastRequestLatencyMs > 100;
+            InstanceEndpoint worker;
+            if (!site.InstanceList.TryGetValue(ipAddress, out worker))
+            {
+                // TODO: Trace warning - the worker may have been removed before the request came back
+                return;
+            }
 
             Interlocked.Decrement(ref worker.PendingRequestCount);
 
-            // TODO: Check for 429 or high latency
+            // If this is the request we're using as a health sample, clear it so another request can be selected.
+            if (worker.HealthTrackingRequestId == requestId)
+            {
+                worker.HealthTrackingRequestId = null;
+            }
+
+            // If the request is rejected because the instance is too busy, mark the endpoint as busy for the next N seconds.
+            // This flag will be cleared the next time a request arrives after the busy status expires.
+            if (statusCode == 429 && statusPhrase == "Instance Too Busy")
+            {
+                worker.IsBusy = true;
+                worker.IsBusyUntil = GetCurrentTickCount() + BusyStatusDuration;
+                // TODO: Trace
+            }
         }
 
-        protected abstract Task<IList<string>> OnScaleOutAsync(int targetWorkerCount);
+        protected abstract Task<string[]> OnScaleOutAsync(string siteName, int targetInstanceCount);
 
-        protected abstract Task<HttpStatusCode> OnPingAsync(string ipAddress);
+        protected abstract Task<HttpStatusCode?> OnPingAsync(string siteName, string ipAddress, string defaultHostName);
 
-        private void UpdateWorkerList(IList<string> updatedWorkerList)
+        // Intended for unit testing
+        protected IReadOnlyList<string> GetWorkerList(string siteName)
         {
-            if (updatedWorkerList.Count > this.workerList.Count || this.workerList.Count <= 5)
+            SiteMetadata site;
+            if (!this.knownSites.TryGetValue(siteName, out site))
             {
-                var now = HttpScaleEnvironment.TickCount;
-                foreach (var workerName in updatedWorkerList)
-                {
-                    var workerStatus = this.workerList.GetOrAdd(workerName, ipAddress => new WorkerStatus(ipAddress));
-                    workerStatus.LastRequestDispatchTick = now;
-                }
+                return new string[0];
+            }
 
-                var stale = now - 30000;
-                foreach (var workerName in this.workerList.Where(w => w.Value.LastRequestDispatchTick < stale).Select(w => w.Key))
+            lock (site)
+            {
+                return site.InstanceList.Keys.ToList().AsReadOnly();
+            }
+        }
+
+        protected bool GetBurstModeStatus(string siteName)
+        {
+            SiteMetadata site;
+            return this.knownSites.TryGetValue(siteName, out site) && site.IsBurstMode;
+        }
+
+        private static uint GetCurrentTickCount()
+        {
+            // Gets the number of milliseconds elapsed since the system started. The int value overflows at 24.9 days
+            // and wraps around to -int.MaxValue. Converting to uint gives us almost 50 days of valid use, and Azure
+            // VMs should never be up that long (due to monthly OS patching).
+            return (uint)Environment.TickCount;
+        }
+
+        private int UpdateWorkerList(SiteMetadata site, string[] currentWorkerSet)
+        {
+            uint now = GetCurrentTickCount();
+
+            // Union the cached list of known workers with the list provided by the FE. The list from the FE
+            // may be stale, so we have to accept new workers generously and carefully age out stale workers.
+            foreach (string ipAddress in currentWorkerSet)
+            {
+                InstanceEndpoint worker = site.InstanceList.GetOrAdd(ipAddress, ip => new InstanceEndpoint(ip));
+                worker.LastRefreshTimestamp = now;
+
+                // Clear the busy status for workers whose busy status is ready to expire.
+                if (worker.IsBusy && worker.IsBusyUntil < now)
                 {
-                    WorkerStatus unused;
-                    this.workerList.TryRemove(workerName, out unused);
+                    worker.IsBusy = false;
                 }
             }
 
-            this.isBurstMode = this.workerList.Count < this.environment.DynamicComputeHttpScaleBurstLimit;
-
-            //System.Diagnostics.Debug.WriteLine("Upd {0} {1} workers, {2}", DateTime.UtcNow, updatedWorkerList.Count, string.Join(",", updatedWorkerList.OrderBy(n => n).ToArray()));
-            //System.Diagnostics.Debug.WriteLine("New {0} {1} workers, {2}", DateTime.UtcNow, this.workerList.Count, string.Join(",", this.workerList.Select(w => w.Key).OrderBy(n => n).ToArray()));
-            //System.Diagnostics.Debug.WriteLine(string.Empty);
-
-            /*
-            lock (this.thisLock)
+            // This is a performance-sensitive code path so we throttle the age-out logic to avoid using excess CPU.
+            if (now >= site.NextWorkerExpirationTick && Monitor.TryEnter(site))
             {
-                // Replace the existing list with a new one, preserving existing stats.
-                var newList = new Dictionary<string, WorkerStatus>();
-                var now = DateTime.UtcNow;
-                foreach (string ipAddress in updatedWorkerList)
+                try
                 {
-                    WorkerStatus workerStatus;
-                    if (this.workerList == null || !this.workerList.TryGetValue(ipAddress, out workerStatus))
+                    // Expire workers that have not been seen for the last N seconds.
+                    uint expirationThreshold = now - WorkerExpirationDelay;
+                    foreach (InstanceEndpoint worker in site.InstanceList.Values.Where(w => w.LastRefreshTimestamp < expirationThreshold))
                     {
-                        // newly added worker
-                        workerStatus = new WorkerStatus(ipAddress);
-                    }
-                    else
-                    {
-                        workerStatus.LastRequestDispatchTick = HttpScaleEnvironment.TickCount;
+                        InstanceEndpoint unused;
+                        site.InstanceList.TryRemove(worker.IPAddress, out unused);
                     }
 
-                    newList.Add(ipAddress, workerStatus);
+                    // Wait M seconds before doing another worker expiration check.
+                    site.NextWorkerExpirationTick = now + WorkerExpirationCheckInterval;
                 }
-
-                if (this.workerList != null)
+                finally
                 {
-                    var stale = HttpScaleEnvironment.TickCount - 60000;
-                    foreach (var worker in this.workerList.Where(w => w.Value.LastRequestDispatchTick > stale))
-                    {
-                        if (!newList.ContainsKey(worker.Key))
-                        {
-                            newList[worker.Key] = worker.Value;
-                        }
-                    }
+                    Monitor.Exit(site);
                 }
-
-                this.isBurstMode = newList.Count < this.environment.DynamicComputeHttpScaleBurstLimit;
-
-                //if (newList.Count >= this.configuration.DynamicComputeHttpScaleBurstLimit)
-                //{
-                //    // Burst mode is turned off for the remainder of the session
-                //    this.isBurstMode = false;
-                //}
-                //else if (this.workerList.Count == 0)
-                //{
-                //    // Going from zero to one worker initiates burst mode
-                //    this.isBurstMode = true;
-                //}
-
-                // TODO, suwatch
-                //System.Diagnostics.Debug.WriteLine("Upd {0} {1}", DateTime.UtcNow, string.Join(",", updatedWorkerList.ToArray()));
-                //System.Diagnostics.Debug.WriteLine("New {0} {1}", DateTime.UtcNow, string.Join(",", newList.Select(w => w.Key).ToArray()));
-                //System.Diagnostics.Debug.WriteLine("Old {0} {1}", DateTime.UtcNow, string.Join(",", this.workerList.Select(w => w.Key).ToArray()));
-                //System.Diagnostics.Debug.WriteLine(string.Empty);
-
-                this.workerList = newList;
             }
-            */
+
+            site.IsBurstMode = site.InstanceList.Count < this.burstLimit;
+            return site.InstanceList.Count;
         }
 
-        private async Task<WorkerStatus> SelectBurstModeWorkerAsync()
+        private async Task<InstanceEndpoint> SelectBurstModeWorkerAsync(SiteMetadata site)
         {
+            InstanceEndpoint best = null;
+
             // Try to get the best idle instance
-            WorkerStatus best = null;
-            foreach (WorkerStatus worker in this.GetWorkersInPriorityOrder())
+            foreach (InstanceEndpoint worker in GetWorkersInPriorityOrder(site))
             {
                 if (best == null)
                 {
@@ -249,104 +250,93 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
             // Note that there will be a cold-start penalty for this request, but it's
             // been decided that this is better than sending a request to an existing
             // but potentially CPU-pegged instance.
-            WorkerStatus newInstance = await this.ScaleOutAsync(Math.Min(this.workerList.Count + 1, this.environment.DynamicComputeHttpScaleBurstLimit));
+            int targetInstanceCount = Math.Max(this.burstLimit, site.InstanceList.Count + 1);
+            InstanceEndpoint newInstance = await this.ScaleOutAsync(site, targetInstanceCount);
+
+            // If we failed to scale out, return the best worker we have.
             return newInstance ?? best;
         }
 
-        private IEnumerable<WorkerStatus> GetWorkersInPriorityOrder()
+        private static IEnumerable<InstanceEndpoint> GetWorkersInPriorityOrder(SiteMetadata site)
         {
-            // TODO: Look at other factors, like latency or status codes
-            // lock (this.thisLock)
-            {
-                //return this.workerList.Values.Where(w => !w.IsBusy).OrderBy(w => w.PendingRequestCount);
-                return this.workerList.Values.OrderBy(w => w.PendingRequestCount);
-            }
+            // TODO: Look at other factors, like latency, busy status, or status codes
+            return site.InstanceList.Values.OrderBy(w => w.PendingRequestCount);
         }
 
-        private async Task<WorkerStatus> ScaleOutAsync(int targetCount)
+        private async Task<InstanceEndpoint> ScaleOutAsync(SiteMetadata site, int targetInstanceCount)
         {
-            //System.Diagnostics.Debug.WriteLine("Scal {0} {1}", DateTime.UtcNow, targetCount);
-            //System.Diagnostics.Debug.WriteLine(string.Empty);
+            uint now = GetCurrentTickCount();
 
-            await _scaleLock.WaitAsync();
-            try
+            // Ensure that only one thread attempts to scale out at a time. Other threads will effectively no-op.
+            if (site.InstanceList.Count < targetInstanceCount &&
+                (site.IsBurstMode || site.NextAllowedScaleOut <= now) &&
+                Interlocked.CompareExchange(ref site.ScaleLock, 1, 0) == 0)
             {
-                if (this.workerList.Count >= targetCount)
+                try
                 {
-                    // TODO, cgillum: to recalculate the best worker again if already scaled
-                    return this.GetWorkersInPriorityOrder().First();
-                }
-
-                WorkerStatus selected = null;
-                var workers = await this.OnScaleOutAsync(targetCount);
-                if (workers != null)
-                {
-                    var now = HttpScaleEnvironment.TickCount;
-                    foreach (var workerName in workers)
+                    string[] ipAddresses = await this.OnScaleOutAsync(site.Name, targetInstanceCount);
+                    if (ipAddresses != null)
                     {
-                        var worker = this.workerList.GetOrAdd(workerName, ipAddress => new WorkerStatus(ipAddress));
-                        worker.LastRequestDispatchTick = now;
-
-                        //System.Diagnostics.Debug.WriteLine("Add {0} {1}", DateTime.UtcNow, workerName);
-                        //System.Diagnostics.Debug.WriteLine(string.Empty);
-
-                        if (selected == null)
-                        {
-                            selected = worker;
-                        }
+                        this.UpdateWorkerList(site, ipAddresses);
                     }
                 }
-
-                return selected;
-            }
-            finally
-            {
-                _scaleLock.Release();
-            }
-
-            /*
-            var ipAddress = workers != null ? workers.FirstOrDefault(w => !this.workerList.ContainsKey(w)) : null;
-            if (ipAddress == null)
-            {
-                // This is assumed to mean that there is no more capacity.
-                return null;
+                finally
+                {
+                    site.NextAllowedScaleOut = now + ScaleInterval;
+                    site.ScaleLock = 0;
+                }
             }
 
-            var worker = new WorkerStatus(ipAddress);
-            lock (this.workerList)
-            {
-                this.workerList.Add(ipAddress, worker);
-            }
-
-            return worker;
-            */
+            // It is expected in most cases that this will return the newly added worker (if any).
+            return GetWorkersInPriorityOrder(site).FirstOrDefault();
         }
 
-        private Task<int> PingAsync(string workerName)
+        private async Task<bool> PingAsync(string siteName, InstanceEndpoint instance, string defaultHostName)
         {
-            throw new NotImplementedException();
+            // A null status code is interpreted to be equivalent to a timeout or an error sending the ping.
+            // All other status codes are assumed to mean that the endpoint is unhealthy.
+            HttpStatusCode? statusCode = await this.OnPingAsync(siteName, instance.IPAddress, defaultHostName);
+            return statusCode != null && statusCode < HttpStatusCode.BadRequest;
         }
 
-        class WorkerStatus
+        class SiteMetadata
         {
-            public WorkerStatus(string ipAddress)
+            internal int ScaleLock;
+
+            public SiteMetadata(string name)
+            {
+                this.Name = name;
+                this.InstanceList = new ConcurrentDictionary<string, InstanceEndpoint>();
+            }
+
+            public string Name { get; private set; }
+
+            public bool IsBurstMode { get; set; }
+
+            public ConcurrentDictionary<string, InstanceEndpoint> InstanceList { get; private set; }
+
+            public uint NextWorkerExpirationTick { get; set; }
+
+            public uint NextAllowedScaleOut { get; set; }
+        }
+
+        class InstanceEndpoint
+        {
+            public int PingLock;
+            public int PendingRequestCount;
+            public string HealthTrackingRequestId;
+            public uint HealthTrackingRequestStartTime;
+
+            public InstanceEndpoint(string ipAddress)
             {
                 this.IPAddress = ipAddress;
-                this.LastRequestDispatchTick = HttpScaleEnvironment.TickCount;
             }
 
-            public uint LastRequestDispatchTick;
-            public uint LastRequestCompleteTick;
-            public uint LastRequestLatencyMs;
-            public string IPAddress;
-            public int PendingRequestCount;
-            public uint LastPingTick;
-            public uint LastPingLatency;
-
-            // TODO, cgillum: remove pragma
-#pragma warning disable 0649
-            public bool IsBusy;
-#pragma warning restore 0649
+            public string IPAddress { get; private set; }
+            public bool IsBusy { get; set; }
+            public uint IsBusyUntil { get; set; }
+            public uint LastRefreshTimestamp { get; set; }
+            public uint NextAllowedPingTime { get; set; }
 
             public override string ToString()
             {
