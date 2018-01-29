@@ -8,30 +8,28 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Web.Hosting.Tracing;
 
 namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
 {
     public abstract class SiteRequestDispatcher
     {
         // All time are in ticks, which are equivalent to milliseconds, but are cheaper to calculate
-        private const uint BusyStatusDuration = 2000;
+        internal const uint BusyStatusDuration = 2000;
         private const uint QuestionableRequestLatency = 2000;
         private const uint WorkerExpirationDelay = 40000;
         private const uint WorkerExpirationCheckInterval = 5000;
+        private const uint WorkerMetricsTraceInterval = 10000;
         private const uint PingInterval = 5000;
-        private const uint PingTimeout = 400;
-        private const uint ScaleInterval = 1000;
-
-        private const uint QuestionablePendingRequestCount = 50;
-        private const double QuestionableInstanceRatio = 0.5;
+        private const int MaxLockTime = 1000;
+        private const int QuestionablePendingRequestCount = 50;
 
         private readonly int burstLimit;
         private readonly ConcurrentDictionary<string, SiteMetadata> knownSites;
-
+        
         public SiteRequestDispatcher(int burstLimit)
         {
             this.burstLimit = burstLimit;
@@ -46,71 +44,140 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
         {
             SiteMetadata site = this.knownSites.GetOrAdd(siteName, name => new SiteMetadata(siteName));
 
-            int currentInstanceCount = this.UpdateWorkerList(site, knownWorkers);
+            this.UpdateWorkerList(site, knownWorkers);
 
-            InstanceEndpoint selectedWorker;
-
-            bool isBurstMode = site.IsBurstMode;
-            if (isBurstMode)
+            InstanceEndpoint bestInstance = site.Endpoints.ReserveBestInstance(null);
+            if (site.IsBurstMode)
             {
-                selectedWorker = await this.SelectBurstModeWorkerAsync(site);
-            }
-            else
-            {
-                selectedWorker = GetWorkersInPriorityOrder(site).FirstOrDefault();
-                if (selectedWorker.IsBusy)
+                if (bestInstance.PendingRequestCount <= 1)
                 {
-                    // The best worker is busy, so we know it's time to scale.
-                    InstanceEndpoint newInstance = await this.ScaleOutAsync(site, currentInstanceCount + 1);
-                    selectedWorker = newInstance ?? selectedWorker;
+                    // Endpoint is idle - choose it.
+                    return bestInstance.IPAddress;
                 }
-
-                // Pick one request at a time to use for latency tracking
-                uint now = GetCurrentTickCount();
-                if (Interlocked.CompareExchange(ref selectedWorker.HealthTrackingRequestId, requestId, null) == null)
+                else
                 {
-                    selectedWorker.HealthTrackingRequestStartTime = now;
-                }
-
-                // If it's a new worker or one that's not serving requests, we'll use it right away. Otherwise
-                // we'll check to see if a ping test is needed, in which case we might decide to scale.
-                if (selectedWorker.PendingRequestCount > 0 &&
-                    selectedWorker.NextAllowedPingTime <= now &&
-                    Interlocked.CompareExchange(ref selectedWorker.PingLock, 1, 0) == 0)
-                {
-                    bool isHealthy = true;
-                    try
+                    // All endpoints are occupied; try to scale out.
+                    using (var scaleLock = await site.ScaleLock.LockAsync(MaxLockTime))
                     {
-                        // Count the number of instances that are of "questionable" health. Use that number
-                        // to decide whether a ping test is needed.
-                        int questionableInstances = site.InstanceList.Values.Count(instance =>
-                            instance.PendingRequestCount > QuestionablePendingRequestCount ||
-                            instance.HealthTrackingRequestStartTime < now - QuestionableRequestLatency);
-
-                        if (questionableInstances >= site.InstanceList.Count * QuestionableInstanceRatio)
+                        if (scaleLock.TimedOut)
                         {
-                            isHealthy = await this.PingAsync(siteName, selectedWorker, defaultHostName);
+                            // The caller should return 429 to avoid overloading the current role
+                            Debug.WriteLine("Timed-out waiting to start a scale operation in burst mode.");
+                            AntaresEventProvider.EventWriteLBHttpDispatchSiteWarningMessage(site.Name, "DispatchRequest", string.Format("Timed-out ({0}ms) waiting to start a scale operation in burst mode. Reverting to {1}.", MaxLockTime, bestInstance.IPAddress));
+                            return bestInstance.IPAddress;
+                        }
+
+                        if (site.IsBurstMode)
+                        {
+                            // No instances are idle, scale-out and send the request to the new instance.
+                            // Note that there will be a cold-start penalty for this request, but it's
+                            // been decided that this is better than sending a request to an existing
+                            // but potentially CPU-pegged instance.
+                            int targetInstanceCount = Math.Min(this.burstLimit, site.Endpoints.Count + 1);
+                            InstanceEndpoint newInstance = await this.ScaleOutAsync(
+                                site,
+                                targetInstanceCount,
+                                bestInstance);
+                            return newInstance.IPAddress;
                         }
                     }
-                    finally
+                }
+            }
+
+            // Pick one request at a time to use for latency tracking
+            uint now = GetCurrentTickCount();
+            if (Interlocked.CompareExchange(ref bestInstance.HealthTrackingRequestId, requestId, null) == null)
+            {
+                bestInstance.HealthTrackingRequestStartTime = now;
+            }
+
+            if (bestInstance.PendingRequestCount <= 1)
+            {
+                // This is an idle worker (the current request is the pending one).
+                return bestInstance.IPAddress;
+            }
+
+            if (bestInstance.IsBusy)
+            {
+                using (var result = await site.ScaleLock.LockAsync(MaxLockTime))
+                {
+                    if (result.TimedOut)
                     {
-                        selectedWorker.NextAllowedPingTime = now + PingInterval;
-                        selectedWorker.PingLock = 0;
+                        // Scale operations are unhealthy
+                        Debug.WriteLine("Timed-out waiting to start a scale operation on busy instance.");
+                        AntaresEventProvider.EventWriteLBHttpDispatchSiteWarningMessage(site.Name, "DispatchRequest", string.Format("Timed-out ({0}ms) waiting to start a scale operation on a busy instance {1}.", MaxLockTime, bestInstance.IPAddress));
+                        return bestInstance.IPAddress;
                     }
 
-                    if (!isHealthy)
+                    if (!bestInstance.IsBusy)
                     {
-                        selectedWorker.IsBusyUntil = now + BusyStatusDuration;
-                        selectedWorker.IsBusy = true;
+                        // The instance became healthy while we were waiting.
+                        return bestInstance.IPAddress;
+                    }
 
-                        InstanceEndpoint newInstance = await this.ScaleOutAsync(site, currentInstanceCount + 1);
-                        selectedWorker = newInstance ?? selectedWorker;
+                    // Serialize scale-out requests to avoid overloading our infrastructure. Each serialized scale
+                    // request will request one more instance from the previous request which can result in rapid-scale out.
+                    bestInstance = await this.ScaleOutAsync(site, site.Endpoints.Count + 1, bestInstance);
+                    if (bestInstance.IsBusy)
+                    {
+                        // Scale-out failed
+                        Debug.WriteLine("Best instance is still busy after a scale operation.");
+                        AntaresEventProvider.EventWriteLBHttpDispatchSiteWarningMessage(site.Name, "DispatchRequest", string.Format("Best instance {0} is still busy after a scale operation.", bestInstance.IPAddress));
+                    }
+
+                    return bestInstance.IPAddress;
+                }
+            }
+
+            bool isQuestionable =
+                bestInstance.PendingRequestCount > QuestionablePendingRequestCount ||
+                bestInstance.HealthTrackingRequestStartTime < now - QuestionableRequestLatency;
+
+            if (isQuestionable &&
+                bestInstance.NextAllowedPingTime <= now &&
+                Interlocked.CompareExchange(ref bestInstance.PingLock, 1, 0) == 0)
+            {
+                bool isHealthy;
+                try
+                {
+                    isHealthy = await this.PingAsync(siteName, bestInstance, defaultHostName);
+                }
+                finally
+                {
+                    bestInstance.NextAllowedPingTime = now + PingInterval;
+                    bestInstance.PingLock = 0;
+                }
+
+                if (!isHealthy)
+                {
+                    site.Endpoints.SetIsBusy(bestInstance);
+
+                    // Serialize scale-out requests to avoid overloading our infrastructure. Each serialized scale
+                    // request will request one more instance from the previous request which can result in rapid-scale out.
+                    using (var result = await site.ScaleLock.LockAsync(MaxLockTime))
+                    {
+                        if (result.TimedOut)
+                        {
+                            // Scale operations are unhealthy
+                            Debug.WriteLine("Timed-out waiting to start a scale operation after unhealthy ping.");
+                            AntaresEventProvider.EventWriteLBHttpDispatchSiteWarningMessage(site.Name, "DispatchRequest", string.Format("Timed-out ({0}ms) waiting to start a scale operation after unhealthy ping to {1}.", MaxLockTime, bestInstance.IPAddress));
+                            return bestInstance.IPAddress;
+                        }
+
+                        bestInstance = await this.ScaleOutAsync(site, site.Endpoints.Count + 1, bestInstance);
+                        if (bestInstance.IsBusy)
+                        {
+                            // Scale-out failed
+                            Debug.WriteLine("Best worker is still busy after a ping-initiated scale.");
+                            AntaresEventProvider.EventWriteLBHttpDispatchSiteWarningMessage(site.Name, "DispatchRequest", string.Format("Best worker {0} is still busy after a ping-initiated scale.", bestInstance.IPAddress));
+                        }
+
+                        return bestInstance.IPAddress;
                     }
                 }
             }
 
-            Interlocked.Increment(ref selectedWorker.PendingRequestCount);
-            return selectedWorker.IPAddress;
+            return bestInstance.IPAddress;
         }
 
         public void OnRequestCompleted(
@@ -126,28 +193,27 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
                 throw new ArgumentException(string.Format("Site '{0}' does not exist in the list of known sites.", siteName));
             }
 
-            InstanceEndpoint worker;
-            if (!site.InstanceList.TryGetValue(ipAddress, out worker))
+            InstanceEndpoint instance;
+            if (!site.Endpoints.TryGetValue(ipAddress, out instance))
             {
-                // TODO: Trace warning - the worker may have been removed before the request came back
+                Debug.WriteLine("OnRequestCompleted: Worker '{0}' was not found.", (object)ipAddress);
+                AntaresEventProvider.EventWriteLBHttpDispatchEndpointInfoMessage(site.Name, ipAddress, "OnRequestCompleted", "Worker not found");
                 return;
             }
 
-            Interlocked.Decrement(ref worker.PendingRequestCount);
+            site.Endpoints.OnRequestCompleted(instance);
 
             // If this is the request we're using as a health sample, clear it so another request can be selected.
-            if (worker.HealthTrackingRequestId == requestId)
+            if (instance.HealthTrackingRequestId == requestId)
             {
-                worker.HealthTrackingRequestId = null;
+                instance.HealthTrackingRequestId = null;
             }
 
             // If the request is rejected because the instance is too busy, mark the endpoint as busy for the next N seconds.
             // This flag will be cleared the next time a request arrives after the busy status expires.
             if (statusCode == 429 && statusPhrase == "Instance Too Busy")
             {
-                worker.IsBusy = true;
-                worker.IsBusyUntil = GetCurrentTickCount() + BusyStatusDuration;
-                // TODO: Trace
+                site.Endpoints.SetIsBusy(instance);
             }
         }
 
@@ -159,17 +225,15 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
         protected IReadOnlyList<string> GetWorkerList(string siteName)
         {
             SiteMetadata site;
-            if (!this.knownSites.TryGetValue(siteName, out site))
+            if (this.knownSites.TryGetValue(siteName, out site))
             {
-                return new string[0];
+                return site.Endpoints.GetIPAddresses();
             }
 
-            lock (site)
-            {
-                return site.InstanceList.Keys.ToList().AsReadOnly();
-            }
+            return new string[0];
         }
 
+        // Intended for unit testing
         protected bool GetBurstModeStatus(string siteName)
         {
             SiteMetadata site;
@@ -192,13 +256,32 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
             // may be stale, so we have to accept new workers generously and carefully age out stale workers.
             foreach (string ipAddress in currentWorkerSet)
             {
-                InstanceEndpoint worker = site.InstanceList.GetOrAdd(ipAddress, ip => new InstanceEndpoint(ip));
-                worker.LastRefreshTimestamp = now;
+                InstanceEndpoint instance = site.Endpoints.GetOrAdd(ipAddress);
+                instance.LastRefreshTimestamp = now;
 
                 // Clear the busy status for workers whose busy status is ready to expire.
-                if (worker.IsBusy && worker.IsBusyUntil < now)
+                if (instance.IsBusy && instance.IsBusyUntil < now)
                 {
-                    worker.IsBusy = false;
+                    site.Endpoints.ClearBusyStatus(instance);
+                }
+
+                // Periodically trace the health statistics of the workers
+                if (instance.NextMetricsTraceTime == 0)
+                {
+                    instance.NextMetricsTraceTime = now + WorkerMetricsTraceInterval;
+                }
+                else if (now > instance.NextMetricsTraceTime && Monitor.TryEnter(instance))
+                {
+                    try
+                    {
+                        Debug.WriteLine("UpdateWorkerList: Worker metrics for site {0}: {1}", site.Name, instance.ToString());
+                        AntaresEventProvider.EventWriteLBHttpDispatchEndpointMetrics(site.Name, instance.IPAddress, instance.PendingRequestCount, instance.IsBusy, instance.Weight);
+                        instance.NextMetricsTraceTime = now + WorkerMetricsTraceInterval;
+                    }
+                    finally
+                    {
+                        Monitor.Exit(instance);
+                    }
                 }
             }
 
@@ -207,13 +290,7 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
             {
                 try
                 {
-                    // Expire workers that have not been seen for the last N seconds.
-                    uint expirationThreshold = now - WorkerExpirationDelay;
-                    foreach (InstanceEndpoint worker in site.InstanceList.Values.Where(w => w.LastRefreshTimestamp < expirationThreshold))
-                    {
-                        InstanceEndpoint unused;
-                        site.InstanceList.TryRemove(worker.IPAddress, out unused);
-                    }
+                    site.Endpoints.RemoveStaleEntries(site.NextWorkerExpirationTick);
 
                     // Wait M seconds before doing another worker expiration check.
                     site.NextWorkerExpirationTick = now + WorkerExpirationCheckInterval;
@@ -224,71 +301,26 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
                 }
             }
 
-            site.IsBurstMode = site.InstanceList.Count < this.burstLimit;
-            return site.InstanceList.Count;
+            site.IsBurstMode = site.Endpoints.Count < this.burstLimit;
+            return site.Endpoints.Count;
         }
 
-        private async Task<InstanceEndpoint> SelectBurstModeWorkerAsync(SiteMetadata site)
+        // Caller must be holding an async lock
+        private async Task<InstanceEndpoint> ScaleOutAsync(
+            SiteMetadata site,
+            int targetInstanceCount,
+            InstanceEndpoint previousEndpoint)
         {
-            InstanceEndpoint best = null;
-
-            // Try to get the best idle instance
-            foreach (InstanceEndpoint worker in GetWorkersInPriorityOrder(site))
+            Debug.WriteLine("Attempting to scale out to " + targetInstanceCount);
+            AntaresEventProvider.EventWriteLBHttpDispatchSiteInfoMessage(site.Name, "ScaleOut", string.Format("Attempting to scale out to {0} instances.", targetInstanceCount));
+            string[] ipAddresses = await this.OnScaleOutAsync(site.Name, targetInstanceCount);
+            if (ipAddresses != null)
             {
-                if (best == null)
-                {
-                    best = worker;
-                }
-
-                if (worker.PendingRequestCount == 0)
-                {
-                    return worker;
-                }
-            }
-
-            // No instances are idle, scale-out and send the request to the new guy.
-            // Note that there will be a cold-start penalty for this request, but it's
-            // been decided that this is better than sending a request to an existing
-            // but potentially CPU-pegged instance.
-            int targetInstanceCount = Math.Max(this.burstLimit, site.InstanceList.Count + 1);
-            InstanceEndpoint newInstance = await this.ScaleOutAsync(site, targetInstanceCount);
-
-            // If we failed to scale out, return the best worker we have.
-            return newInstance ?? best;
-        }
-
-        private static IEnumerable<InstanceEndpoint> GetWorkersInPriorityOrder(SiteMetadata site)
-        {
-            // TODO: Look at other factors, like latency, busy status, or status codes
-            return site.InstanceList.Values.OrderBy(w => w.PendingRequestCount);
-        }
-
-        private async Task<InstanceEndpoint> ScaleOutAsync(SiteMetadata site, int targetInstanceCount)
-        {
-            uint now = GetCurrentTickCount();
-
-            // Ensure that only one thread attempts to scale out at a time. Other threads will effectively no-op.
-            if (site.InstanceList.Count < targetInstanceCount &&
-                (site.IsBurstMode || site.NextAllowedScaleOut <= now) &&
-                Interlocked.CompareExchange(ref site.ScaleLock, 1, 0) == 0)
-            {
-                try
-                {
-                    string[] ipAddresses = await this.OnScaleOutAsync(site.Name, targetInstanceCount);
-                    if (ipAddresses != null)
-                    {
-                        this.UpdateWorkerList(site, ipAddresses);
-                    }
-                }
-                finally
-                {
-                    site.NextAllowedScaleOut = now + ScaleInterval;
-                    site.ScaleLock = 0;
-                }
+                this.UpdateWorkerList(site, ipAddresses);
             }
 
             // It is expected in most cases that this will return the newly added worker (if any).
-            return GetWorkersInPriorityOrder(site).FirstOrDefault();
+            return site.Endpoints.ReserveBestInstance(previousEndpoint);
         }
 
         private async Task<bool> PingAsync(string siteName, InstanceEndpoint instance, string defaultHostName)
@@ -297,55 +329,6 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
             // All other status codes are assumed to mean that the endpoint is unhealthy.
             HttpStatusCode? statusCode = await this.OnPingAsync(siteName, instance.IPAddress, defaultHostName);
             return statusCode != null && statusCode < HttpStatusCode.BadRequest;
-        }
-
-        class SiteMetadata
-        {
-            internal int ScaleLock;
-
-            public SiteMetadata(string name)
-            {
-                this.Name = name;
-                this.InstanceList = new ConcurrentDictionary<string, InstanceEndpoint>();
-            }
-
-            public string Name { get; private set; }
-
-            public bool IsBurstMode { get; set; }
-
-            public ConcurrentDictionary<string, InstanceEndpoint> InstanceList { get; private set; }
-
-            public uint NextWorkerExpirationTick { get; set; }
-
-            public uint NextAllowedScaleOut { get; set; }
-        }
-
-        class InstanceEndpoint
-        {
-            public int PingLock;
-            public int PendingRequestCount;
-            public string HealthTrackingRequestId;
-            public uint HealthTrackingRequestStartTime;
-
-            public InstanceEndpoint(string ipAddress)
-            {
-                this.IPAddress = ipAddress;
-            }
-
-            public string IPAddress { get; private set; }
-            public bool IsBusy { get; set; }
-            public uint IsBusyUntil { get; set; }
-            public uint LastRefreshTimestamp { get; set; }
-            public uint NextAllowedPingTime { get; set; }
-
-            public override string ToString()
-            {
-                return string.Format(
-                    "{0}: Requests = {1}, IsBusy = {2}",
-                    this.IPAddress,
-                    this.PendingRequestCount,
-                    this.IsBusy);
-            }
         }
     }
 }

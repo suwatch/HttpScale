@@ -147,7 +147,7 @@ namespace Microsoft.Web.Hosting.RewriteProvider.HttpScale
                 string workerName;
                 ParseCompletedRequestId(requestId, out runtimeSiteName, out originalRequestId, out workerName);
 
-                _manager.OnRequestCompleted(requestId, runtimeSiteName, (int)statusCode, statusReason, workerName);
+                _manager.OnRequestCompleted(originalRequestId, runtimeSiteName, (int)statusCode, statusReason, workerName);
             }
         }
 
